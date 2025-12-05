@@ -1,10 +1,11 @@
 # zai-proxy
 
-zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换为 OpenAI API 兼容格式。用户使用自己的 z.ai token 进行调用。
+zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换为 OpenAI 和 Anthropic Claude API 兼容格式。用户使用自己的 z.ai token 进行调用。
 
 ## 功能特性
 
 - OpenAI API 兼容格式
+- Anthropic Claude API 兼容格式
 - 支持流式和非流式响应
 - 支持多种 GLM 模型
 - 支持思考模式 (thinking)
@@ -94,7 +95,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## 使用示例
 
-### curl 测试
+### OpenAI 格式
+
+#### curl 测试
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -107,7 +110,7 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### 多模态请求：
+#### 多模态请求：
 
 ```json
 {
@@ -118,6 +121,46 @@ curl http://localhost:8000/v1/chat/completions \
       "content": [
         {"type": "text", "text": "描述这张图片"},
         {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
+      ]
+    }
+  ]
+}
+```
+
+### Claude 格式
+
+#### curl 测试
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: YOUR_ZAI_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+#### 多模态请求：
+
+```json
+{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "描述这张图片"},
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "url": "https://example.com/image.jpg"
+          }
+        }
       ]
     }
   ]

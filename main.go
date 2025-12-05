@@ -11,8 +11,12 @@ func main() {
 	internal.InitLogger()
 	internal.StartVersionUpdater()
 
+	// OpenAI 格式端点
 	http.HandleFunc("/v1/models", internal.HandleModels)
 	http.HandleFunc("/v1/chat/completions", internal.HandleChatCompletions)
+
+	// Claude 格式端点
+	http.HandleFunc("/v1/messages", internal.HandleClaudeChatCompletions)
 
 	addr := ":" + internal.Cfg.Port
 	internal.LogInfo("Server starting on %s", addr)
