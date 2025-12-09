@@ -24,7 +24,6 @@ func extractLatestUserContent(messages []Message) string {
 	return ""
 }
 
-// 提取所有消息中的图片URL
 func extractAllImageURLs(messages []Message) []string {
 	var allImageURLs []string
 	for _, msg := range messages {
@@ -60,12 +59,15 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 
 	enableThinking := IsThinkingModel(model)
 	autoWebSearch := IsSearchModel(model)
-	// GLM-4.5-V 不支持 auto_web_search
-	if targetModel == "glm-4.5v" {
+	if targetModel == "glm-4.5v" || targetModel == "glm-4.6v" {
 		autoWebSearch = false
 	}
 
-	// 上传图片并建立URL→FileID映射
+	var mcpServers []string
+	if targetModel == "glm-4.6v" {
+		mcpServers = []string{"vlm-image-search", "vlm-image-recognition", "vlm-image-processing"}
+	}
+
 	urlToFileID := make(map[string]string)
 	var filesData []map[string]interface{}
 	if len(imageURLs) > 0 {
@@ -90,7 +92,6 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 		}
 	}
 
-	// 转换消息为上游格式
 	var upstreamMessages []map[string]interface{}
 	for _, msg := range messages {
 		upstreamMessages = append(upstreamMessages, msg.ToUpstreamMessage(urlToFileID))
@@ -113,7 +114,10 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 		"id":      uuid.New().String(),
 	}
 
-	// 添加files字段
+	if len(mcpServers) > 0 {
+		body["mcp_servers"] = mcpServers
+	}
+
 	if len(filesData) > 0 {
 		body["files"] = filesData
 		body["current_user_message_id"] = userMsgID
@@ -135,9 +139,6 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 	req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", uuid.New().String()))
 	req.Header.Set("User-Agent", uarand.GetRandom())
 
-	// LogDebug("[Request] URL: %s", url)
-	// LogDebug("[Request] Headers: %v", req.Header)
-
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -157,19 +158,34 @@ type UpstreamData struct {
 	} `json:"data"`
 }
 
-// 思考内容过滤器状态
+func (u *UpstreamData) GetEditContent() string {
+	editContent := u.Data.EditContent
+	if editContent == "" {
+		return ""
+	}
+
+	if len(editContent) > 0 && editContent[0] == '"' {
+		var unescaped string
+		if err := json.Unmarshal([]byte(editContent), &unescaped); err == nil {
+			LogDebug("[GetEditContent] Unescaped edit_content from JSON string")
+			return unescaped
+		}
+	}
+
+	return editContent
+}
+
 type ThinkingFilter struct {
 	hasSeenFirstThinking bool
 	buffer               string
+	lastOutputChunk      string
+	lastPhase            string
+	thinkingRoundCount   int
 }
 
-// 处理思考阶段的内容
-// 第一个 delta_content 包含 <details...>\n<summary>Thinking…</summary>\n> 前缀，需要过滤
-// 后续 delta_content 需要替换 "\n> " 为 "\n"（跨块累积处理）
 func (f *ThinkingFilter) ProcessThinking(deltaContent string) string {
 	if !f.hasSeenFirstThinking {
 		f.hasSeenFirstThinking = true
-		// 第一个 thinking 内容，查找 "> " 之后的内容
 		if idx := strings.Index(deltaContent, "> "); idx != -1 {
 			deltaContent = deltaContent[idx+2:]
 		} else {
@@ -177,15 +193,11 @@ func (f *ThinkingFilter) ProcessThinking(deltaContent string) string {
 		}
 	}
 
-	// 合并缓冲区内容
 	content := f.buffer + deltaContent
 	f.buffer = ""
 
-	// 替换完整的 "\n> " 为 "\n"
 	content = strings.ReplaceAll(content, "\n> ", "\n")
 
-	// 检查末尾是否有可能是 "\n> " 的前缀
-	// 可能的前缀："\n", "\n>"
 	if strings.HasSuffix(content, "\n>") {
 		f.buffer = "\n>"
 		return content[:len(content)-2]
@@ -198,17 +210,13 @@ func (f *ThinkingFilter) ProcessThinking(deltaContent string) string {
 	return content
 }
 
-// Flush 返回缓冲区中剩余的内容
 func (f *ThinkingFilter) Flush() string {
 	result := f.buffer
 	f.buffer = ""
 	return result
 }
 
-// 从 answer 阶段的 edit_content 中提取完整思考内容
-// 格式：true" duration="0" ...>\n<summary>Thought for 0 seconds</summary>\n> 完整思考内容\n</details>\n你好
 func (f *ThinkingFilter) ExtractCompleteThinking(editContent string) string {
-	// 查找 "> " 到 "</details>" 之间的内容
 	startIdx := strings.Index(editContent, "> ")
 	if startIdx == -1 {
 		return ""
@@ -221,9 +229,32 @@ func (f *ThinkingFilter) ExtractCompleteThinking(editContent string) string {
 	}
 
 	content := editContent[startIdx:endIdx]
-	// 替换 "\n> " 为 "\n"
 	content = strings.ReplaceAll(content, "\n> ", "\n")
 	return content
+}
+
+func (f *ThinkingFilter) ExtractIncrementalThinking(editContent string) string {
+	completeThinking := f.ExtractCompleteThinking(editContent)
+	if completeThinking == "" {
+		return ""
+	}
+
+	if f.lastOutputChunk == "" {
+		return completeThinking
+	}
+
+	idx := strings.Index(completeThinking, f.lastOutputChunk)
+	if idx == -1 {
+		return completeThinking
+	}
+
+	incrementalPart := completeThinking[idx+len(f.lastOutputChunk):]
+	return incrementalPart
+}
+
+func (f *ThinkingFilter) ResetForNewRound() {
+	f.lastOutputChunk = ""
+	f.hasSeenFirstThinking = false
 }
 
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -233,7 +264,6 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 如果 token 是 "free"，获取匿名 token
 	if token == "free" {
 		anonymousToken, err := GetAnonymousToken()
 		if err != nil {
@@ -299,6 +329,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	searchRefFilter := NewSearchRefFilter()
 	thinkingFilter := &ThinkingFilter{}
 	pendingSourcesMarkdown := ""
+	pendingImageSearchMarkdown := ""
+	totalContentOutputLength := 0 // 记录已输出的 content 字符长度
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -322,64 +354,113 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			break
 		}
 
-		// 处理思考阶段的增量内容
 		if upstream.Data.Phase == "thinking" && upstream.Data.DeltaContent != "" {
-			// 如果有待输出的搜索结果，先输出到 reasoning
-			if pendingSourcesMarkdown != "" {
-				hasContent = true
-				chunk := ChatCompletionChunk{
-					ID:      completionID,
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   modelName,
-					Choices: []Choice{{
-						Index:        0,
-						Delta:        Delta{ReasoningContent: pendingSourcesMarkdown},
-						FinishReason: nil,
-					}},
-				}
-				data, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
-				pendingSourcesMarkdown = ""
+			isNewThinkingRound := false
+			if thinkingFilter.lastPhase != "" && thinkingFilter.lastPhase != "thinking" {
+				thinkingFilter.ResetForNewRound()
+				thinkingFilter.thinkingRoundCount++
+				isNewThinkingRound = true
 			}
+			thinkingFilter.lastPhase = "thinking"
 
 			reasoningContent := thinkingFilter.ProcessThinking(upstream.Data.DeltaContent)
-			reasoningContent = searchRefFilter.Process(reasoningContent)
+
+			if isNewThinkingRound && thinkingFilter.thinkingRoundCount > 1 && reasoningContent != "" {
+				reasoningContent = "\n\n" + reasoningContent
+			}
+
 			if reasoningContent != "" {
-				hasContent = true
-				chunk := ChatCompletionChunk{
-					ID:      completionID,
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   modelName,
-					Choices: []Choice{{
-						Index:        0,
-						Delta:        Delta{ReasoningContent: reasoningContent},
-						FinishReason: nil,
-					}},
+				thinkingFilter.lastOutputChunk = reasoningContent
+				reasoningContent = searchRefFilter.Process(reasoningContent)
+
+				if reasoningContent != "" {
+					hasContent = true
+					chunk := ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   modelName,
+						Choices: []Choice{{
+							Index:        0,
+							Delta:        Delta{ReasoningContent: reasoningContent},
+							FinishReason: nil,
+						}},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
 				}
-				data, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
 			}
 			continue
 		}
 
-		// 解析搜索结果，暂存等待下一个流决定放在哪里
-		if upstream.Data.EditContent != "" && IsSearchResultContent(upstream.Data.EditContent) {
-			if results := ParseSearchResults(upstream.Data.EditContent); len(results) > 0 {
+		if upstream.Data.Phase != "" {
+			thinkingFilter.lastPhase = upstream.Data.Phase
+		}
+
+		editContent := upstream.GetEditContent()
+		if editContent != "" && IsSearchResultContent(editContent) {
+			if results := ParseSearchResults(editContent); len(results) > 0 {
 				searchRefFilter.AddSearchResults(results)
 				pendingSourcesMarkdown = searchRefFilter.GetSearchResultsMarkdown()
 			}
 			continue
 		}
-		// 跳过搜索工具调用
-		if upstream.Data.EditContent != "" && IsSearchToolCall(upstream.Data.EditContent, upstream.Data.Phase) {
+		if editContent != "" && strings.Contains(editContent, `"search_image"`) {
+			textBeforeBlock := ExtractTextBeforeGlmBlock(editContent)
+			if textBeforeBlock != "" {
+				textBeforeBlock = searchRefFilter.Process(textBeforeBlock)
+				if textBeforeBlock != "" {
+					hasContent = true
+					chunk := ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   modelName,
+						Choices: []Choice{{
+							Index:        0,
+							Delta:        Delta{Content: textBeforeBlock},
+							FinishReason: nil,
+						}},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
+			}
+			if results := ParseImageSearchResults(editContent); len(results) > 0 {
+				pendingImageSearchMarkdown = FormatImageSearchResults(results)
+			}
+			continue
+		}
+		if editContent != "" && strings.Contains(editContent, `"mcp"`) {
+			textBeforeBlock := ExtractTextBeforeGlmBlock(editContent)
+			if textBeforeBlock != "" {
+				textBeforeBlock = searchRefFilter.Process(textBeforeBlock)
+				if textBeforeBlock != "" {
+					hasContent = true
+					chunk := ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   modelName,
+						Choices: []Choice{{
+							Index:        0,
+							Delta:        Delta{Content: textBeforeBlock},
+							FinishReason: nil,
+						}},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
+			}
+			continue
+		}
+		if editContent != "" && IsSearchToolCall(editContent, upstream.Data.Phase) {
 			continue
 		}
 
-		// 进入 answer 阶段，如果有待输出的搜索结果，先输出到 content
 		if pendingSourcesMarkdown != "" {
 			hasContent = true
 			chunk := ChatCompletionChunk{
@@ -398,14 +479,32 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			flusher.Flush()
 			pendingSourcesMarkdown = ""
 		}
+		if pendingImageSearchMarkdown != "" {
+			hasContent = true
+			chunk := ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   modelName,
+				Choices: []Choice{{
+					Index:        0,
+					Delta:        Delta{Content: pendingImageSearchMarkdown},
+					FinishReason: nil,
+				}},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			pendingImageSearchMarkdown = ""
+		}
 
 		content := ""
 		reasoningContent := ""
 
-		// 先输出 thinking 缓冲区剩余内容
 		if thinkingRemaining := thinkingFilter.Flush(); thinkingRemaining != "" {
-			thinkingRemaining = searchRefFilter.Process(thinkingRemaining) + searchRefFilter.Flush()
-			if thinkingRemaining != "" {
+			thinkingFilter.lastOutputChunk = thinkingRemaining
+			processedRemaining := searchRefFilter.Process(thinkingRemaining)
+			if processedRemaining != "" {
 				hasContent = true
 				chunk := ChatCompletionChunk{
 					ID:      completionID,
@@ -414,7 +513,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 					Model:   modelName,
 					Choices: []Choice{{
 						Index:        0,
-						Delta:        Delta{ReasoningContent: thinkingRemaining},
+						Delta:        Delta{ReasoningContent: processedRemaining},
 						FinishReason: nil,
 					}},
 				}
@@ -424,22 +523,53 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			}
 		}
 
-		if upstream.Data.Phase == "answer" && upstream.Data.DeltaContent != "" {
-			content = upstream.Data.DeltaContent
-		} else if upstream.Data.Phase == "answer" && upstream.Data.EditContent != "" {
-			// 思考模型首次 answer：提取完整思考内容 + 正常回复开头
-			if strings.Contains(upstream.Data.EditContent, "</details>") {
-				reasoningContent = thinkingFilter.ExtractCompleteThinking(upstream.Data.EditContent)
-				if idx := strings.Index(upstream.Data.EditContent, "</details>\n"); idx != -1 {
-					content = upstream.Data.EditContent[idx+len("</details>\n"):]
-				}
+		if pendingSourcesMarkdown != "" && thinkingFilter.hasSeenFirstThinking {
+			hasContent = true
+			chunk := ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   modelName,
+				Choices: []Choice{{
+					Index:        0,
+					Delta:        Delta{ReasoningContent: pendingSourcesMarkdown},
+					FinishReason: nil,
+				}},
 			}
-		} else if (upstream.Data.Phase == "other" || upstream.Data.Phase == "tool_call") && upstream.Data.EditContent != "" {
-			// other: 普通最后一个 token; tool_call: 搜索模式最后一个 token
-			content = upstream.Data.EditContent
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			pendingSourcesMarkdown = ""
 		}
 
-		// 输出完整思考内容（如果有）
+		if upstream.Data.Phase == "answer" && upstream.Data.DeltaContent != "" {
+			content = upstream.Data.DeltaContent
+		} else if upstream.Data.Phase == "answer" && editContent != "" {
+			if strings.Contains(editContent, "</details>") {
+				reasoningContent = thinkingFilter.ExtractIncrementalThinking(editContent)
+
+				if idx := strings.Index(editContent, "</details>"); idx != -1 {
+					afterDetails := editContent[idx+len("</details>"):]
+					if strings.HasPrefix(afterDetails, "\n") {
+						content = afterDetails[1:]
+					} else {
+						content = afterDetails
+					}
+					totalContentOutputLength = len([]rune(content))
+				}
+			}
+		} else if (upstream.Data.Phase == "other" || upstream.Data.Phase == "tool_call") && editContent != "" {
+			fullContent := editContent
+			fullContentRunes := []rune(fullContent)
+
+			if len(fullContentRunes) > totalContentOutputLength {
+				content = string(fullContentRunes[totalContentOutputLength:])
+				totalContentOutputLength = len(fullContentRunes)
+			} else {
+				content = fullContent
+			}
+		}
+
 		if reasoningContent != "" {
 			reasoningContent = searchRefFilter.Process(reasoningContent) + searchRefFilter.Flush()
 		}
@@ -465,13 +595,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			continue
 		}
 
-		// 过滤搜索引用标记（跨流累积处理）
 		content = searchRefFilter.Process(content)
 		if content == "" {
 			continue
 		}
 
 		hasContent = true
+		if upstream.Data.Phase == "answer" && upstream.Data.DeltaContent != "" {
+			totalContentOutputLength += len([]rune(content))
+		}
+
 		chunk := ChatCompletionChunk{
 			ID:      completionID,
 			Object:  "chat.completion.chunk",
@@ -493,7 +626,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		LogError("[Upstream] scanner error: %v", err)
 	}
 
-	// 输出过滤器中剩余的内容（非引用标记的部分）
 	if remaining := searchRefFilter.Flush(); remaining != "" {
 		hasContent = true
 		chunk := ChatCompletionChunk{
@@ -516,7 +648,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		LogError("Stream response 200 but no content received")
 	}
 
-	// Final chunk
 	stopReason := "stop"
 	finalChunk := ChatCompletionChunk{
 		ID:      completionID,
@@ -545,6 +676,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 	searchRefFilter := NewSearchRefFilter()
 	hasThinking := false
 	pendingSourcesMarkdown := ""
+	pendingImageSearchMarkdown := ""
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -567,50 +699,92 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 		}
 
 		if upstream.Data.Phase == "thinking" && upstream.Data.DeltaContent != "" {
-			if pendingSourcesMarkdown != "" {
-				reasoningChunks = append(reasoningChunks, pendingSourcesMarkdown)
-				pendingSourcesMarkdown = ""
+			if thinkingFilter.lastPhase != "" && thinkingFilter.lastPhase != "thinking" {
+				thinkingFilter.ResetForNewRound()
+				thinkingFilter.thinkingRoundCount++
+				if thinkingFilter.thinkingRoundCount > 1 {
+					reasoningChunks = append(reasoningChunks, "\n\n")
+				}
 			}
+			thinkingFilter.lastPhase = "thinking"
+
 			hasThinking = true
 			reasoningContent := thinkingFilter.ProcessThinking(upstream.Data.DeltaContent)
 			if reasoningContent != "" {
+				thinkingFilter.lastOutputChunk = reasoningContent
 				reasoningChunks = append(reasoningChunks, reasoningContent)
 			}
 			continue
 		}
 
-		if upstream.Data.EditContent != "" && IsSearchResultContent(upstream.Data.EditContent) {
-			if results := ParseSearchResults(upstream.Data.EditContent); len(results) > 0 {
+		if upstream.Data.Phase != "" {
+			thinkingFilter.lastPhase = upstream.Data.Phase
+		}
+
+		editContent := upstream.GetEditContent()
+		if editContent != "" && IsSearchResultContent(editContent) {
+			if results := ParseSearchResults(editContent); len(results) > 0 {
 				searchRefFilter.AddSearchResults(results)
 				pendingSourcesMarkdown = searchRefFilter.GetSearchResultsMarkdown()
 			}
 			continue
 		}
-		if upstream.Data.EditContent != "" && IsSearchToolCall(upstream.Data.EditContent, upstream.Data.Phase) {
+		if editContent != "" && strings.Contains(editContent, `"search_image"`) {
+			textBeforeBlock := ExtractTextBeforeGlmBlock(editContent)
+			if textBeforeBlock != "" {
+				chunks = append(chunks, textBeforeBlock)
+			}
+			// 解析图片搜索结果
+			if results := ParseImageSearchResults(editContent); len(results) > 0 {
+				pendingImageSearchMarkdown = FormatImageSearchResults(results)
+			}
+			continue
+		}
+		if editContent != "" && strings.Contains(editContent, `"mcp"`) {
+			textBeforeBlock := ExtractTextBeforeGlmBlock(editContent)
+			if textBeforeBlock != "" {
+				chunks = append(chunks, textBeforeBlock)
+			}
+			continue
+		}
+		if editContent != "" && IsSearchToolCall(editContent, upstream.Data.Phase) {
 			continue
 		}
 
-		// 进入 answer 阶段，把待输出的搜索结果放到 content
-		if pendingSourcesMarkdown != "" && !hasThinking {
-			chunks = append(chunks, pendingSourcesMarkdown)
+		if pendingSourcesMarkdown != "" {
+			if hasThinking {
+				reasoningChunks = append(reasoningChunks, pendingSourcesMarkdown)
+			} else {
+				chunks = append(chunks, pendingSourcesMarkdown)
+			}
 			pendingSourcesMarkdown = ""
+		}
+		if pendingImageSearchMarkdown != "" {
+			chunks = append(chunks, pendingImageSearchMarkdown)
+			pendingImageSearchMarkdown = ""
 		}
 
 		content := ""
 		if upstream.Data.Phase == "answer" && upstream.Data.DeltaContent != "" {
 			content = upstream.Data.DeltaContent
-		} else if upstream.Data.Phase == "answer" && upstream.Data.EditContent != "" {
-			if strings.Contains(upstream.Data.EditContent, "</details>") {
-				reasoningContent := thinkingFilter.ExtractCompleteThinking(upstream.Data.EditContent)
+		} else if upstream.Data.Phase == "answer" && editContent != "" {
+			if strings.Contains(editContent, "</details>") {
+				reasoningContent := thinkingFilter.ExtractIncrementalThinking(editContent)
 				if reasoningContent != "" {
 					reasoningChunks = append(reasoningChunks, reasoningContent)
 				}
-				if idx := strings.Index(upstream.Data.EditContent, "</details>\n"); idx != -1 {
-					content = upstream.Data.EditContent[idx+len("</details>\n"):]
+
+				if idx := strings.Index(editContent, "</details>"); idx != -1 {
+					afterDetails := editContent[idx+len("</details>"):]
+					if strings.HasPrefix(afterDetails, "\n") {
+						content = afterDetails[1:]
+					} else {
+						content = afterDetails
+					}
 				}
 			}
-		} else if (upstream.Data.Phase == "other" || upstream.Data.Phase == "tool_call") && upstream.Data.EditContent != "" {
-			content = upstream.Data.EditContent
+		} else if (upstream.Data.Phase == "other" || upstream.Data.Phase == "tool_call") && editContent != "" {
+			content = editContent
 		}
 
 		if content != "" {

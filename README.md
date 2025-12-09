@@ -86,6 +86,7 @@ curl http://localhost:8000/v1/chat/completions \
 | GLM-4.5 | 0727-360B-API |
 | GLM-4.6 | GLM-4-6-API-V1 |
 | GLM-4.5-V | glm-4.5v |
+| GLM-4.6-V | glm-4.6v |
 | GLM-4.5-Air | 0727-106B-API |
 
 ### 模型标签

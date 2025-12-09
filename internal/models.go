@@ -12,6 +12,7 @@ var BaseModelMapping = map[string]string{
 	"GLM-4.5":      "0727-360B-API",
 	"GLM-4.6":      "GLM-4-6-API-V1",
 	"GLM-4.5-V":    "glm-4.5v",
+	"GLM-4.6-V":    "glm-4.6v",
 	"GLM-4.5-Air":  "0727-106B-API",
 	"0808-360B-DR": "0808-360B-DR",
 }
@@ -23,6 +24,8 @@ var ModelList = []string{
 	"GLM-4.5-thinking",
 	"GLM-4.6-thinking",
 	"GLM-4.5-V",
+	"GLM-4.6-V",
+	"GLM-4.6-V-thinking",
 	"GLM-4.5-Air",
 	"0808-360B-DR",
 }
@@ -189,8 +192,8 @@ type ChatCompletionResponse struct {
 }
 
 type ModelsResponse struct {
-	Object string       `json:"object"`
-	Data   []ModelInfo  `json:"data"`
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
 }
 
 type ModelInfo struct {
@@ -233,7 +236,6 @@ func escapeMarkdownTitle(title string) string {
 	return title
 }
 
-// Process 将搜索引用转换为 markdown 链接，末尾可能的不完整引用暂存
 func (f *SearchRefFilter) Process(content string) string {
 	content = f.buffer + content
 	f.buffer = ""
@@ -313,21 +315,17 @@ func (f *SearchRefFilter) GetSearchResultsMarkdown() string {
 	return sb.String()
 }
 
-// 检查是否为搜索结果内容（需要跳过）
 func IsSearchResultContent(editContent string) bool {
 	return strings.Contains(editContent, `"search_result"`)
 }
 
-// ParseSearchResults 从 edit_content 中解析搜索结果
 func ParseSearchResults(editContent string) []SearchResult {
-	// 查找 "search_result": 的位置
 	searchResultKey := `"search_result":`
 	idx := strings.Index(editContent, searchResultKey)
 	if idx == -1 {
 		return nil
 	}
 
-	// 找到 [ 开始的位置
 	startIdx := idx + len(searchResultKey)
 	for startIdx < len(editContent) && editContent[startIdx] != '[' {
 		startIdx++
@@ -336,7 +334,6 @@ func ParseSearchResults(editContent string) []SearchResult {
 		return nil
 	}
 
-	// 找到匹配的 ] 结束位置
 	bracketCount := 0
 	endIdx := startIdx
 	for endIdx < len(editContent) {
@@ -356,7 +353,6 @@ func ParseSearchResults(editContent string) []SearchResult {
 		return nil
 	}
 
-	// 解析 JSON 数组
 	jsonStr := editContent[startIdx:endIdx]
 	var rawResults []struct {
 		Title string `json:"title"`
@@ -382,11 +378,149 @@ func ParseSearchResults(editContent string) []SearchResult {
 	return results
 }
 
-// 检查是否为搜索工具调用内容（需要跳过）
 func IsSearchToolCall(editContent string, phase string) bool {
 	if phase != "tool_call" {
 		return false
 	}
 	// tool_call 阶段包含 mcp 相关内容的都跳过
 	return strings.Contains(editContent, `"mcp"`) || strings.Contains(editContent, `mcp-server`)
+}
+
+type ImageSearchResult struct {
+	Title     string `json:"title"`
+	Link      string `json:"link"`
+	Thumbnail string `json:"thumbnail"`
+}
+
+func ParseImageSearchResults(editContent string) []ImageSearchResult {
+	resultKey := `"result":`
+	idx := strings.Index(editContent, resultKey)
+	if idx == -1 {
+		return nil
+	}
+
+	startIdx := idx + len(resultKey)
+	for startIdx < len(editContent) && editContent[startIdx] != '[' {
+		startIdx++
+	}
+	if startIdx >= len(editContent) {
+		return nil
+	}
+
+	bracketCount := 0
+	endIdx := startIdx
+	inString := false
+	escapeNext := false
+	for endIdx < len(editContent) {
+		ch := editContent[endIdx]
+
+		if escapeNext {
+			escapeNext = false
+			endIdx++
+			continue
+		}
+
+		if ch == '\\' {
+			escapeNext = true
+			endIdx++
+			continue
+		}
+
+		if ch == '"' {
+			inString = !inString
+		}
+
+		if !inString {
+			if ch == '[' || ch == '{' {
+				bracketCount++
+			} else if ch == ']' || ch == '}' {
+				bracketCount--
+				if bracketCount == 0 && ch == ']' {
+					endIdx++
+					break
+				}
+			}
+		}
+		endIdx++
+	}
+
+	if bracketCount != 0 {
+		return nil
+	}
+
+	jsonStr := editContent[startIdx:endIdx]
+
+	var rawResults []map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &rawResults); err != nil {
+		return nil
+	}
+
+	var results []ImageSearchResult
+	for _, item := range rawResults {
+		if itemType, ok := item["type"].(string); ok && itemType == "text" {
+			if text, ok := item["text"].(string); ok {
+				result := parseImageSearchText(text)
+				if result.Title != "" && result.Link != "" {
+					results = append(results, result)
+				}
+			}
+		}
+	}
+
+	return results
+}
+
+func parseImageSearchText(text string) ImageSearchResult {
+	result := ImageSearchResult{}
+
+	if titleIdx := strings.Index(text, "Title: "); titleIdx != -1 {
+		titleStart := titleIdx + len("Title: ")
+		titleEnd := strings.Index(text[titleStart:], ";")
+		if titleEnd != -1 {
+			result.Title = strings.TrimSpace(text[titleStart : titleStart+titleEnd])
+		}
+	}
+
+	if linkIdx := strings.Index(text, "Link: "); linkIdx != -1 {
+		linkStart := linkIdx + len("Link: ")
+		linkEnd := strings.Index(text[linkStart:], ";")
+		if linkEnd != -1 {
+			result.Link = strings.TrimSpace(text[linkStart : linkStart+linkEnd])
+		} else {
+			result.Link = strings.TrimSpace(text[linkStart:])
+		}
+	}
+
+	if thumbnailIdx := strings.Index(text, "Thumbnail: "); thumbnailIdx != -1 {
+		thumbnailStart := thumbnailIdx + len("Thumbnail: ")
+		result.Thumbnail = strings.TrimSpace(text[thumbnailStart:])
+	}
+
+	return result
+}
+
+func FormatImageSearchResults(results []ImageSearchResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, r := range results {
+		escapedTitle := strings.ReplaceAll(r.Title, `[`, `\[`)
+		escapedTitle = strings.ReplaceAll(escapedTitle, `]`, `\]`)
+		sb.WriteString(fmt.Sprintf("\n![%s](%s)", escapedTitle, r.Link))
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+func ExtractTextBeforeGlmBlock(editContent string) string {
+	if idx := strings.Index(editContent, "<glm_block"); idx != -1 {
+		text := editContent[:idx]
+		if strings.HasSuffix(text, "\n") {
+			text = text[:len(text)-1]
+		}
+		return text
+	}
+	return ""
 }
