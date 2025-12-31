@@ -68,7 +68,7 @@ docker logs -f zai-proxy
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer free" \
   -H "Content-Type: application/json" \
-  -d '{"model": "GLM-4.6", "messages": [{"role": "user", "content": "hello"}]}'
+  -d '{"model": "GLM-4.7", "messages": [{"role": "user", "content": "hello"}]}'
 ```
 
 ### 方式二：使用个人 Token
@@ -85,6 +85,7 @@ curl http://localhost:8000/v1/chat/completions \
 |----------|----------|
 | GLM-4.5 | 0727-360B-API |
 | GLM-4.6 | GLM-4-6-API-V1 |
+| GLM-4.7 | glm-4.7 |
 | GLM-4.5-V | glm-4.5v |
 | GLM-4.6-V | glm-4.6v |
 | GLM-4.5-Air | 0727-106B-API |
@@ -95,12 +96,13 @@ curl http://localhost:8000/v1/chat/completions \
 
 - `-thinking`: 启用思考模式，响应会包含 `reasoning_content` 字段
 - `-search`: 启用联网搜索模式
+- (TODO) `-deepsearch`: 启用多轮搜索，深入研究分析
 
 示例：
 
-- `GLM-4.6-thinking`
-- `GLM-4.6-search`
-- `GLM-4.6-thinking-search`
+- `GLM-4.7-thinking`
+- `GLM-4.7-search`
+- `GLM-4.7-thinking-search`
 
 ## 使用示例
 
@@ -113,7 +115,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer YOUR_ZAI_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "GLM-4.6",
+    "model": "GLM-4.7",
     "messages": [{"role": "user", "content": "hello"}],
     "stream": true
   }'
@@ -123,7 +125,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```json
 {
-  "model": "GLM-4.5-V",
+  "model": "GLM-4.6-V",
   "messages": [
     {
       "role": "user",
