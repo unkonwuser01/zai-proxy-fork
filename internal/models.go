@@ -15,6 +15,8 @@ var BaseModelMapping = map[string]string{
 	"GLM-4.5-V":    "glm-4.5v",
 	"GLM-4.6-V":    "glm-4.6v",
 	"GLM-4.5-Air":  "0727-106B-API",
+	"GLM-5":        "glm-5",
+	"GLM-5-V":      "glm-5v",
 	"0808-360B-DR": "0808-360B-DR",
 }
 
@@ -29,6 +31,11 @@ var ModelList = []string{
 	"GLM-4.6-V",
 	"GLM-4.6-V-thinking",
 	"GLM-4.5-Air",
+	"GLM-5",
+	"GLM-5-thinking",
+	"GLM-5-thinking-search",
+	"GLM-5-V",
+	"GLM-5-V-thinking",
 	// "0808-360B-DR",
 }
 
